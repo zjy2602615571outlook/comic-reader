@@ -1,6 +1,12 @@
 name = "comic-reader-web"
 main = "worker-src/index.ts"
 compatibility_date = "2025-07-01"
+workers_dev = true
+
+# Preview access: comic-reader-web.yuezvjktetzga.workers.dev
+# To serve on the apex domain yuezvjktetzga.cc.cd, add it as a Custom Domain
+# in the dashboard (Workers & Pages -> comic-reader-web -> Settings -> Domains & Routes).
+# The API token used for deploy lacks Workers Routes/DNS permission, so apex binding is manual.
 
 [assets]
 directory = "./dist"
