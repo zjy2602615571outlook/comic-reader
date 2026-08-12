@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  api:
+    build: ./backend
+    image: comic-reader-api:latest
+    container_name: comic-reader-api
+    restart: unless-stopped
+    ports:
+      - "9002:8999"
+    volumes:
+      # Read-only mount of PDF comics directory
+      - /home/zjy/datas/dockerdatas/comic-reader/comics:/app/comics:ro
+      # App cache / runtime data (writable)
+      - /home/zjy/datas/dockerdatas/comic-reader/appdata:/app/data
+    environment:
+      - COMICS_DIR=/app/comics
+      - PORT=8999
+      - ALLOWED_PLATFORMS=web
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8999/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
