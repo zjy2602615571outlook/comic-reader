@@ -29,7 +29,6 @@ export default function PdfViewer({
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
-  const [dims, setDims] = useState<{ w: number; h: number }[]>([]);
   const [numPages, setNumPages] = useState(0);
   const [page, setPage] = useState(1);
   const [mode, setMode] = useState<ReadMode>("scroll");
@@ -38,6 +37,12 @@ export default function PdfViewer({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [toolbarVisible, setToolbarVisible] = useState(true);
+  // base aspect ratio (h/w) learned from the first page; used to estimate
+  // heights of pages that haven't rendered yet (avoids blocking on a full
+  // preload of every page's dimensions = instant first paint).
+  const [baseRatio, setBaseRatio] = useState(1.4);
+  // actual rendered heights per page (snapped in as pages paint)
+  const [heights, setHeights] = useState<Record<number, number>>({});
 
   // ---- load PDF ----
   useEffect(() => {
@@ -45,19 +50,21 @@ export default function PdfViewer({
     setLoading(true);
     setError(null);
     setPdf(null);
-    setDims([]);
     setNumPages(0);
+    setHeights({});
+    setBaseRatio(1.4);
 
     const startPage = loadProgress(comicPath);
 
     (async () => {
       try {
-        const doc = await pdfjsLib.getDocument({
-          url,
-          // range requests handled natively by the backend
-          disableAutoFetch: false,
-          disableStream: false,
-        }).promise;
+        // Linearized PDFs put page 1 at the start. The bottleneck for large
+        // files across the tunnel is the NUMBER of sequential range requests
+        // (each costs one tunnel RTT). A big rangeChunkSize makes pdfjs pull
+        // the first page's data in 1-2 requests instead of dozens, so a 100MB+
+        // file paints page 1 in a couple of seconds. The rest streams in as a
+        // free prefetch for sequential reading.
+        const doc = await pdfjsLib.getDocument({ url, rangeChunkSize: 1 << 21 }).promise;
         if (cancelled) {
           try {
             doc.destroy();
@@ -68,23 +75,23 @@ export default function PdfViewer({
         }
         setPdf(doc);
         setNumPages(doc.numPages);
-
-        // preload page dimensions progressively for stable layout
-        const all: { w: number; h: number }[] = [];
-        for (let i = 1; i <= doc.numPages; i++) {
-          if (cancelled) return;
-          const p = await doc.getPage(i);
-          const v = p.getViewport({ scale: 1 });
-          all[i - 1] = { w: v.width, h: v.height };
-          setDims([...all]);
-        }
         const clampedStart = Math.min(Math.max(1, startPage), doc.numPages);
         setPage(clampedStart);
+        // Show the reader immediately — do NOT block on preloading every
+        // page's dimensions. First page paints as soon as its data arrives.
         setLoading(false);
-        // jump to saved page after layout settles
-        requestAnimationFrame(() => {
-          jumpToPage(clampedStart);
-        });
+        // Learn the real aspect ratio from page 1 (non-blocking) so unrendered
+        // page slots reserve an accurate height.
+        (async () => {
+          try {
+            const p1 = await doc.getPage(1);
+            const v = p1.getViewport({ scale: 1 });
+            if (!cancelled && v.width > 0) setBaseRatio(v.height / v.width);
+          } catch {
+            /* keep default ratio */
+          }
+        })();
+        requestAnimationFrame(() => jumpToPage(clampedStart));
       } catch (e: any) {
         if (cancelled) return;
         console.error(e);
@@ -104,34 +111,33 @@ export default function PdfViewer({
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => {
-      setContainerW(el.clientWidth);
-    });
+    const ro = new ResizeObserver(() => setContainerW(el.clientWidth));
     ro.observe(el);
     setContainerW(el.clientWidth);
     return () => ro.disconnect();
   }, []);
 
-  // compute display width per page based on zoom / fit
-  const baseWidth = containerW - 32; // padding
+  const baseWidth = containerW - 32;
   const displayWidth = (() => {
     if (mode === "single") {
-      // single: fit to height-ish width, but allow zoom
       const w = fit ? Math.min(baseWidth, 1000) : baseWidth * zoom;
       return Math.max(200, w);
     }
-    // scroll: zoom multiplies base width
     return Math.max(200, baseWidth * zoom);
   })();
 
-  // per-page height at display scale
-  const heightFor = useCallback(
-    (i: number) => {
-      const d = dims[i];
-      if (!d) return displayWidth * 1.4;
-      return (d.h / d.w) * displayWidth;
+  const estimateFor = useCallback(
+    (n: number) => heights[n] ?? displayWidth * baseRatio,
+    [heights, displayWidth, baseRatio]
+  );
+
+  const onReady = useCallback(
+    (n: number, h: number) => {
+      setHeights((prev) =>
+        prev[n] && Math.abs(prev[n] - h) < 1 ? prev : { ...prev, [n]: h }
+      );
     },
-    [dims, displayWidth]
+    []
   );
 
   // ---- progress save (debounced) ----
@@ -141,7 +147,6 @@ export default function PdfViewer({
     return () => clearTimeout(t);
   }, [page, comicPath, pdf]);
 
-  // save on unmount
   useEffect(() => {
     return () => {
       if (numPages > 0) saveProgress(comicPath, page);
@@ -158,22 +163,14 @@ export default function PdfViewer({
         const el = scrollRef.current?.querySelector(
           `[data-page="${target}"]`
         ) as HTMLElement | null;
-        if (el) {
-          el.scrollIntoView({ behavior: "smooth", block: "start" });
-        }
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
       }
     },
     [mode, numPages]
   );
 
-  const next = useCallback(
-    () => jumpToPage(page + 1),
-    [jumpToPage, page]
-  );
-  const prev = useCallback(
-    () => jumpToPage(page - 1),
-    [jumpToPage, page]
-  );
+  const next = useCallback(() => jumpToPage(page + 1), [jumpToPage, page]);
+  const prev = useCallback(() => jumpToPage(page - 1), [jumpToPage, page]);
 
   // ---- toolbar auto-hide ----
   useEffect(() => {
@@ -200,7 +197,6 @@ export default function PdfViewer({
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
-
       switch (e.key) {
         case "ArrowRight":
         case "d":
@@ -214,12 +210,6 @@ export default function PdfViewer({
           if (mode === "single") {
             e.preventDefault();
             prev();
-          }
-          break;
-        case "ArrowDown":
-        case " ":
-          if (mode === "scroll") {
-            // let default scroll happen
           }
           break;
         case "+":
@@ -281,7 +271,6 @@ export default function PdfViewer({
     setZoom(1);
   };
 
-  // ---- rendering ----
   const onEnter = useCallback((n: number) => setPage(n), []);
 
   if (loading) {
@@ -325,13 +314,9 @@ export default function PdfViewer({
     >
       {/* ---- reader body ---- */}
       {mode === "scroll" ? (
-        <div
-          ref={scrollRef}
-          className="scroll-thin h-full overflow-y-auto px-4 py-2"
-        >
+        <div ref={scrollRef} className="scroll-thin h-full overflow-y-auto px-4 py-2">
           {pdf &&
             Array.from({ length: numPages }, (_, i) => i + 1).map((n) => {
-              const idx = n - 1;
               const active = Math.abs(n - page) <= 2;
               return (
                 <PdfPage
@@ -339,9 +324,10 @@ export default function PdfViewer({
                   pdf={pdf}
                   pageNumber={n}
                   width={displayWidth}
-                  height={heightFor(idx)}
+                  estimatedHeight={estimateFor(n)}
                   active={active}
                   onEnter={onEnter}
+                  onReady={onReady}
                 />
               );
             })}
@@ -355,11 +341,10 @@ export default function PdfViewer({
               pdf={pdf}
               pageNumber={page}
               width={displayWidth}
-              height={heightFor(page - 1)}
+              estimatedHeight={estimateFor(page)}
               active={true}
             />
           )}
-          {/* click zones */}
           <button
             aria-label="上一页"
             onClick={prev}
@@ -382,21 +367,12 @@ export default function PdfViewer({
         }`}
       >
         <div className="pointer-events-auto mx-auto mt-2 flex max-w-3xl items-center gap-2 rounded-xl border border-white/10 bg-[#1f1f1f]/95 px-3 py-2 text-sm text-neutral-200 shadow-lg backdrop-blur">
-          <button
-            onClick={onClose}
-            className="rounded px-2 py-1 hover:bg-white/10"
-            title="返回列表"
-          >
+          <button onClick={onClose} className="rounded px-2 py-1 hover:bg-white/10" title="返回列表">
             ‹ 返回
           </button>
           <div className="mx-1 h-5 w-px bg-white/10" />
 
-          <button
-            onClick={prev}
-            disabled={page <= 1}
-            className="rounded px-2 py-1 hover:bg-white/10 disabled:opacity-40"
-            title="上一页 (←)"
-          >
+          <button onClick={prev} disabled={page <= 1} className="rounded px-2 py-1 hover:bg-white/10 disabled:opacity-40" title="上一页 (←)">
             ◀
           </button>
           <div className="tabular-nums">
@@ -413,60 +389,27 @@ export default function PdfViewer({
             />
             <span className="mx-1 text-neutral-500">/ {numPages}</span>
           </div>
-          <button
-            onClick={next}
-            disabled={page >= numPages}
-            className="rounded px-2 py-1 hover:bg-white/10 disabled:opacity-40"
-            title="下一页 (→)"
-          >
+          <button onClick={next} disabled={page >= numPages} className="rounded px-2 py-1 hover:bg-white/10 disabled:opacity-40" title="下一页 (→)">
             ▶
           </button>
 
           <div className="mx-1 h-5 w-px bg-white/10" />
 
-          <button
-            onClick={zoomOut}
-            className="rounded px-2 py-1 hover:bg-white/10"
-            title="缩小 (-)"
-          >
-            －
-          </button>
-          <button
-            onClick={resetZoom}
-            className="w-14 rounded px-1 py-1 text-center tabular-nums hover:bg-white/10"
-            title="重置缩放"
-          >
+          <button onClick={zoomOut} className="rounded px-2 py-1 hover:bg-white/10" title="缩小 (-)">－</button>
+          <button onClick={resetZoom} className="w-14 rounded px-1 py-1 text-center tabular-nums hover:bg-white/10" title="重置缩放">
             {Math.round((fit ? 1 : zoom) * 100)}%
           </button>
-          <button
-            onClick={zoomIn}
-            className="rounded px-2 py-1 hover:bg-white/10"
-            title="放大 (+)"
-          >
-            ＋
-          </button>
+          <button onClick={zoomIn} className="rounded px-2 py-1 hover:bg-white/10" title="放大 (+)">＋</button>
 
           <div className="mx-1 h-5 w-px bg-white/10" />
 
-          <button
-            onClick={() => setMode((m) => (m === "scroll" ? "single" : "scroll"))}
-            className="rounded px-2 py-1 hover:bg-white/10"
-            title="切换模式 (M)"
-          >
+          <button onClick={() => setMode((m) => (m === "scroll" ? "single" : "scroll"))} className="rounded px-2 py-1 hover:bg-white/10" title="切换模式 (M)">
             {mode === "scroll" ? "连续" : "单页"}
           </button>
-          <button
-            onClick={toggleFullscreen}
-            className="rounded px-2 py-1 hover:bg-white/10"
-            title="全屏 (F)"
-          >
+          <button onClick={toggleFullscreen} className="rounded px-2 py-1 hover:bg-white/10" title="全屏 (F)">
             {isFs ? "⤢" : "⛶"}
           </button>
-          <button
-            onClick={onRequestStealth}
-            className="rounded px-2 py-1 text-neutral-400 hover:bg-white/10 hover:text-white"
-            title="摸鱼模式 (Esc / 空格)"
-          >
+          <button onClick={onRequestStealth} className="rounded px-2 py-1 text-neutral-400 hover:bg-white/10 hover:text-white" title="摸鱼模式 (Esc / 空格)">
             🕶
           </button>
         </div>
