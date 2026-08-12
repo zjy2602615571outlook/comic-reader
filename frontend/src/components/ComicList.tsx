@@ -216,7 +216,7 @@ export default function ComicList({
           type="text"
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="搜索文档…"
+          placeholder="搜索文件…"
           className="min-w-0 flex-1 rounded bg-black/40 px-2 py-1 text-sm outline-none placeholder:text-neutral-500 focus:ring-1 focus:ring-white/30"
         />
         {onClose && (
@@ -262,7 +262,7 @@ export default function ComicList({
           )
         ) : comics.length === 0 ? (
           <div className="p-3 text-center text-sm text-neutral-500">
-            未发现文档
+            未发现文件
           </div>
         ) : (
           sortNodes([...tree.children.values()]).map((node) => (

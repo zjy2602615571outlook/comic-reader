@@ -96,7 +96,7 @@ export default function App() {
             {listOpen ? "☰ 隐藏列表" : "☰ 显示列表"}
           </button>
           <span className="truncate">
-            {current ? current.name : "钉钉文档"}
+            {current ? current.name : "comic-reader"}
           </span>
           <span className="ml-auto">
             <button
@@ -134,8 +134,8 @@ export default function App() {
           ) : !current ? (
             <div className="flex h-full items-center justify-center text-neutral-500">
               {comics.length === 0
-                ? "未发现文档，请将 .pdf 放入 comics 目录后刷新"
-                : "从左侧选择一份文档打开"}
+                ? "未发现文件，请将 .pdf 放入 comics 目录后刷新"
+                : "从左侧打开一个文件开始"}
             </div>
           ) : (
             <PdfViewer
