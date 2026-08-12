@@ -1,18 +1,28 @@
 # Comic Reader — 极简 PDF 漫画在线阅读器
 
 无登录、单页面、支持流式加载与「摸鱼」伪装的 PDF 漫画阅读器。
-后端 FastAPI（只读流式 + Range），前端 React 18 + Vite + Tailwind + pdfjs-dist，前端经 Cloudflare Worker 反代交付。
+后端 FastAPI（只读流式 + Range），前端 React 18 + Vite + Tailwind + pdfjs-dist，前端经 Cloudflare Worker 反代交付，后端经 Cloudflare Tunnel 暴露。**全部资源在一个 Cloudflare 账号下。**
 
-## 架构
+## 实际部署架构（cc.cd 账号 `b6c8…320b`）
 
 ```
-浏览器  ──https──>  Cloudflare Worker (comic-reader-web)  ──/api/*──>  FastAPI (容器 127.0.0.1:9002)
-                          └─ ASSETS: ./dist (SPA)                              └─ /app/comics/*.pdf (只读挂载)
+浏览器
+  │ https://yuezvjktetzga.cc.cd
+  ▼
+Cloudflare Worker (comic-reader-web)         ← 前端 SPA(ASSETS) + /api 反代
+  │ /api/*  → https://comic.yuezvjktetzga.cc.cd
+  ▼
+Cloudflare Tunnel (comic-backend, 041c3db5…)  ← CNAME comic.yuezvjktetzga.cc.cd → *.cfargotunnel.com
+  │ ingress: comic.yuezvjktetzga.cc.cd → http://localhost:9002
+  ▼
+Ubuntu 192.168.0.120  容器 comic-reader-api (0.0.0.0:9002 → 容器 8999)
+  └─ /app/comics/*.pdf (只读挂载)
 ```
 
-- 容器内端口 `8999`，宿主机映射 `9002`，与 `8999/9000` 零冲突。
-- 无数据库、无 Redis，仅一个 FastAPI 容器。
-- 共用宿主机 systemd `cloudflared` 隧道，不含隧道容器。
+- 前端 Worker：`yuezvjktetzga.cc.cd`（apex，AAAA `100::` proxied + Workers Route `yuezvjktetzga.cc.cd/*` → `comic-reader-web`）
+- 后端隧道：账号内自建 tunnel `comic-backend`，ingress `comic.yuezvjktetzga.cc.cd → http://localhost:9002`，DNS CNAME `comic → 041c3db5….cfargotunnel.com`(proxied)
+- 后端隧道连接器：Ubuntu 上**第二个** cloudflared systemd 服务 `cloudflared-comic-backend`（与原有的 26026155.xyz 隧道服务并存，互不影响）
+- QUIC/UDP 7844 在该网络被阻断，隧道自动降级为 HTTP/2（TCP 443），正常工作。
 
 ## 目录
 
@@ -30,64 +40,57 @@
 | `GET` | `/api/comics` | 递归扫描 `/app/comics`，返回 PDF 列表（path/name/size/modified/dir） |
 | `GET` | `/api/comics/stream?path=<相对路径>` | 流式返回 PDF，原生支持 HTTP Range（前端按页/分段加载） |
 
-安全：免登录；`x-client-platform` 软校验默认放行 `web`（可经 `ALLOWED_PLATFORMS` 配置）；CORS 全放行。
+安全：免登录；`x-client-platform` 软校验默认放行 `web`；CORS 全放行。
 
-## 部署步骤
+## 部署/复现步骤
 
-### 1. Cloudflare Zero Trust 新增 Public Hostname
-
-- Subdomain: `comic`
-- Domain: `26026155.xyz`
-- Service: `HTTP -> 127.0.0.1:9002`
-
-### 2. 宿主机创建目录并放入 PDF
+### 后端容器（Ubuntu 192.168.0.120）
 
 ```bash
 mkdir -p /home/zjy/datas/dockerdatas/comic-reader/comics \
          /home/zjy/datas/dockerdatas/comic-reader/appdata \
          /home/zjy/datas/build/comic-reader
+cp /path/to/*.pdf /home/zjy/datas/dockerdatas/comic-reader/comics/   # 支持子目录递归
 
-# 把 .pdf 漫画扔进 comics 目录（支持子目录递归）
-cp /path/to/*.pdf /home/zjy/datas/dockerdatas/comic-reader/comics/
-```
-
-### 3. 拉取代码到构建目录
-
-```bash
 cd /home/zjy/datas/build/comic-reader
-git clone https://github.com/zjy2602615571outlook/comic-reader.git .
-```
-
-### 4. 构建并启动后端容器
-
-```bash
-cd /home/zjy/datas/build/comic-reader
+# 放入 docker-compose.yml + backend/ （从本仓库）
 docker compose up -d --build
+curl -f http://127.0.0.1:9002/health   # 期望 {"status":"ok"}
 ```
 
-### 5. 发布前端到 Cloudflare Pages/Worker（可选，已配置反代）
+> 构建注意：本机 BuildKit 默认 DNS(8.8.8.8) 在国内被墙，`docker-compose.yml` 已设 `build.network: host` 使用宿主 DNS；`Dockerfile` 用阿里云 pip 镜像 `https://mirrors.aliyun.com/pypi/simple/`。
 
-前端构建后通过 `wrangler` 部署（需在 `frontend/` 配置 Cloudflare 账号）：
+### 后端公网隧道（cc.cd 账号，已用 API 自动完成）
+
+通过 Cloudflare API（`cfdomainapitoken`）完成，无需手动：
+1. `POST /accounts/{acct}/cfd_tunnel` 创建 tunnel `comic-backend`
+2. `PUT /accounts/{acct}/cfd_tunnel/{id}/configurations` 设 ingress `comic.yuezvjktetzga.cc.cd → http://localhost:9002`
+3. `POST /zones/{zone}/dns_records` 建 CNAME `comic → {tunnel}.cfargotunnel.com`(proxied)
+4. Ubuntu 上 systemd 服务 `cloudflared-comic-backend` 用 `--token <connector token>` 连接该隧道
+
+### 前端 Worker（cc.cd 账号，已部署）
 
 ```bash
 cd frontend
-npm install
-npm run build
-npx wrangler deploy
+npm install && npm run build
+CLOUDFLARE_API_TOKEN=…  CLOUDFLARE_ACCOUNT_ID=b6c8…320b  npx wrangler deploy
 ```
 
-`wrangler.toml` 中 `BACKEND_ORIGIN = "https://comic.26026155.xyz"` 指向上面隧道的公网域名。
+`wrangler.toml` 关键配置：
+- `routes = [{ pattern = "yuezvjktetzga.cc.cd", custom_domain = true }]`（apex 绑定；实际由 route+DNS 完成）
+- `[vars] BACKEND_ORIGIN = "https://comic.yuezvjktetzga.cc.cd"`
+- `[assets] directory = "./dist", run_worker_first = true`
 
-### 6. 访问
+### 访问
 
-打开 Worker 域名或 `https://comic.26026155.xyz` 即可直接阅读。
+打开 **https://yuezvjktetzga.cc.cd** 直接阅读。把 PDF 扔进 `/home/zjy/datas/dockerdatas/comic-reader/comics/` 后点前端「⟳」刷新即可。
 
 ## 使用说明（前端快捷键）
 
 | 键 | 功能 |
 | --- | --- |
 | `←` / `→` 或 `a` / `d` | 单页模式翻页 |
-| `+` / `-` | 缩放 |
+| `+` / `-` 或 `Ctrl+滚轮` | 缩放 |
 | `F` | 全屏切换 |
 | `M` | 切换连续滚动 / 单页 |
 | `L` | 显示 / 隐藏漫画列表 |

@@ -1,8 +1,8 @@
-version: "3.8"
-
 services:
   api:
-    build: ./backend
+    build:
+      context: ./backend
+      network: host
     image: comic-reader-api:latest
     container_name: comic-reader-api
     restart: unless-stopped
